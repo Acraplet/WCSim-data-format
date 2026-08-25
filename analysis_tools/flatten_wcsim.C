@@ -1,0 +1,344 @@
+// flatten_wcsim.C — flatten a WCSim output file into a simple, uproot-readable tree.
+//
+// Reads the custom WCSim classes (needs libWCSimRoot) and writes a flat TTree
+// "hits" where every digitized hit carries its charge, time and PMT (x,y,z),
+// plus per-event truth (primary particle PDG, energy, vertex, direction).
+//
+// Run inside the container:
+//   root -l -b -q 'flatten_wcsim.C("wcsim.root","flat.root")'
+R__LOAD_LIBRARY($WCSIM_BUILD_DIR/lib/libWCSimRoot.so)
+#include <map>
+#include <set>
+
+void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
+{
+    TFile* f = TFile::Open(fname);
+    if (!f || !f->IsOpen()) { printf("ERROR: cannot open %s\n", fname); return; }
+
+    TTree* t = (TTree*)f->Get("wcsimT");
+    WCSimRootEvent* superevt = new WCSimRootEvent();
+    t->SetBranchAddress("wcsimrootevent", &superevt);
+
+    WCSimRootGeom* geo = 0;
+    TTree* geotree = (TTree*)f->Get("wcsimGeoT");
+    geotree->SetBranchAddress("wcsimrootgeom", &geo);
+    geotree->GetEntry(0);
+
+    TFile* fout = new TFile(foutname, "RECREATE");
+    TTree* out  = new TTree("hits", "flattened WCSim digihits with geometry + truth");
+
+    // WCSim's native geometry is in its OWN frame, offset from the WCTE
+    // convention along y only (see analysis_examples/WCSim_coordinates_and_
+    // mapping_example.ipynb -> WCSimCoordinateTransform, vertical_offset =
+    // 424.7625 mm = 42.47625 cm). All positions written below (hit_*, vtx_*,
+    // start_*, stop_*, track_start/end_*, cher_end_*) have this added to
+    // their y-component so this file uses the WCTE convention directly,
+    // like the rest of the analysis (x and z are unaffected).
+    const float kWCSimToWCTE_Yoffset_cm = 42.47625f;
+
+    // hit_pmt_charges / hit_pmt_calibrated_times use the real WCTE data's
+    // branch names + type (double) instead of WCSim's native float, so this
+    // tree can be read with the same code as WCTE_merged_production_*.root.
+    std::vector<double> hit_pmt_charges, hit_pmt_calibrated_times;
+    std::vector<float> hit_x, hit_y, hit_z;
+    // hit_mpmt_slot_ids / hit_pmt_position_ids follow the WCTE convention (see
+    // analysis_examples/WCSim_coordinates_and_mapping_example.ipynb): the slot
+    // number matches WCSim's native GetmPMTNo() directly, but the position
+    // must be converted from WCSim's 1-indexed GetmPMT_PMTNo() (1-19) to the
+    // WCTE 0-indexed convention (0-18) used by the real WCTE DAQ data
+    // (hit_pmt_position_ids in WCTE_merged_production_*.root).
+    std::vector<int>   hit_tube, hit_mpmt_slot_ids, hit_pmt_position_ids;
+    // hit_track_id: track id of the parent of the (first) true Cherenkov photon
+    // behind this digitized hit. A digihit can combine several true photon
+    // hits within the DAQ time window (pileup/dark noise), so this stores the
+    // parent track of the earliest-indexed contributor as a representative
+    // value, not an exhaustive list. -1 = dark noise; -999 = no truth match found.
+    std::vector<int>   hit_track_id;
+    int   n_digihits = 0, true_pdg = 0, event_number = 0;
+    float true_E = -1, true_p = -1, true_ke = -1, true_length = -1;
+    float vtx_x = 0, vtx_y = 0, vtx_z = 0, dir_x = 0, dir_y = 0, dir_z = 0;
+    float start_x = 0, start_y = 0, start_z = 0, stop_x = 0, stop_y = 0, stop_z = 0;
+
+    // --- what happened to the primary (derived from its Geant4 daughters) ---
+    // `stop_process` = the discrete fate at the stop point ("" = ranged out /
+    // ionization stop): a hadronic process (*Inelastic / hadElastic), an in-flight
+    // "Decay", or an at-rest capture (*CaptureAtRest, e.g. hBertiniCaptureAtRest
+    // for stopped K-/pi-). `had_inelastic`/`had_elastic` flag hadronic interactions.
+    std::string stop_process = "";
+    int had_inelastic = 0, had_elastic = 0, n_prim_daughters = 0;
+
+    // --- every saved track in the event (the primary + all its saved
+    // descendants at any depth - i.e. every track WCSim kept because it, or
+    // one of ITS descendants, produced a PMT-hit photon). Parallel arrays,
+    // one entry per track. ---
+    std::vector<int>         track_id, track_parent_id, track_pdg, track_nhits;
+    std::vector<std::string> track_process;
+    std::vector<float>       track_ke;
+    std::vector<float>       track_start_x, track_start_y, track_start_z;
+    std::vector<float>       track_end_x,   track_end_y,   track_end_z;
+    std::vector<float>       track_dir_x,   track_dir_y,   track_dir_z;
+    // --- where the primary itself stopped making Cherenkov light ---
+    // Emission point of the farthest-along true Cherenkov photon whose parent is
+    // the primary; arclength is measured along the primary direction (cm). This
+    // is a lower bound: only photons that produced a PMT hit are stored.
+    float cher_end_len = -1, cher_end_x = 0, cher_end_y = 0, cher_end_z = 0;
+    int   cher_n_prim = 0;
+    // --- did the primary leave the inner detector (vs range out in the water)? ---
+    // `true_exit_ke` = kinetic energy [MeV] at the primary's blacksheet crossing
+    // (the ID edge); -1 means it never crossed -> it ranged out / interacted inside.
+    // `true_stopvol` is WCSim's stopping-volume code (for reference).
+    int   true_stopvol = -999;
+    float true_exit_ke = -1;
+    // --- beam-proton lineage: # elastic scatters, and whether it ends inelastic ---
+    // Follows the highest-KE hadElastic proton continuation from the primary;
+    // `n_elastic` counts elastic scatters, `n_inelastic` = 1 if the chain ends in
+    // a protonInelastic breakup (so n_elastic>0 & n_inelastic==1 = elastic-then-inelastic).
+    int   n_elastic = 0, n_inelastic = 0;
+
+    out->Branch("hit_pmt_charges", &hit_pmt_charges);
+    out->Branch("hit_pmt_calibrated_times", &hit_pmt_calibrated_times);
+    out->Branch("hit_x", &hit_x);
+    out->Branch("hit_y", &hit_y);
+    out->Branch("hit_z", &hit_z);
+    out->Branch("hit_tube", &hit_tube);             // WCSim tube id (1-based)
+    out->Branch("hit_mpmt_slot_ids", &hit_mpmt_slot_ids);         // mPMT module slot number (WCTE convention)
+    out->Branch("hit_pmt_position_ids", &hit_pmt_position_ids);   // PMT position within the module, 0-indexed (WCTE convention)
+    out->Branch("hit_track_id", &hit_track_id);      // track id of the parent of this hit's (first) true Cherenkov photon
+    out->Branch("n_digihits", &n_digihits);
+    out->Branch("event_number", &event_number);      // placeholder = event loop index (real data's event_number has no MC equivalent)
+    out->Branch("true_pdg", &true_pdg);
+    out->Branch("true_E", &true_E);              // total energy [MeV]
+    out->Branch("true_p", &true_p);              // momentum [MeV/c]
+    out->Branch("true_ke", &true_ke);            // kinetic energy [MeV]
+    out->Branch("true_length", &true_length);    // track length start->stop [cm]
+    out->Branch("true_vtx_x", &vtx_x);
+    out->Branch("true_vtx_y", &vtx_y);
+    out->Branch("true_vtx_z", &vtx_z);
+    out->Branch("true_dir_x", &dir_x);
+    out->Branch("true_dir_y", &dir_y);
+    out->Branch("true_dir_z", &dir_z);
+    out->Branch("true_start_x", &start_x);
+    out->Branch("true_start_y", &start_y);
+    out->Branch("true_start_z", &start_z);
+    out->Branch("true_stop_x", &stop_x);
+    out->Branch("true_stop_y", &stop_y);
+    out->Branch("true_stop_z", &stop_z);
+    out->Branch("stop_process", &stop_process);      // hadronic process at stop ("" = ranged out)
+    out->Branch("had_inelastic", &had_inelastic);    // primary had a *Inelastic daughter
+    out->Branch("had_elastic", &had_elastic);        // primary had a hadElastic daughter
+    out->Branch("n_prim_daughters", &n_prim_daughters);
+    out->Branch("track_id", &track_id);                    // every saved track (primary + all its saved descendants):
+    out->Branch("track_parent_id", &track_parent_id);      //   track id of its parent (primary's parent is WCSim's placeholder incident-track entry, not itself in this list)
+    out->Branch("track_pdg", &track_pdg);                  //   PDG code
+    out->Branch("track_process", &track_process);          //   creator process name
+    out->Branch("track_ke", &track_ke);                    //   kinetic energy [MeV]
+    out->Branch("track_start_x", &track_start_x);          //   start position [cm]
+    out->Branch("track_start_y", &track_start_y);
+    out->Branch("track_start_z", &track_start_z);
+    out->Branch("track_end_x", &track_end_x);              //   stop position [cm]
+    out->Branch("track_end_y", &track_end_y);
+    out->Branch("track_end_z", &track_end_z);
+    out->Branch("track_dir_x", &track_dir_x);              //   initial direction (unit vector)
+    out->Branch("track_dir_y", &track_dir_y);
+    out->Branch("track_dir_z", &track_dir_z);
+    out->Branch("track_nhits", &track_nhits);               //   # true PMT hits it produced
+    out->Branch("cher_end_len", &cher_end_len);      // arclength of last primary Cherenkov emission [cm]
+    out->Branch("cher_end_x", &cher_end_x);          // its position [cm]
+    out->Branch("cher_end_y", &cher_end_y);
+    out->Branch("cher_end_z", &cher_end_z);
+    out->Branch("cher_n_prim", &cher_n_prim);        // # true Cherenkov photons from the primary
+    out->Branch("true_stopvol", &true_stopvol);      // WCSim stopping-volume code
+    out->Branch("true_exit_ke", &true_exit_ke);      // KE at ID-edge crossing [MeV] (-1 = ranged out inside)
+    out->Branch("n_elastic", &n_elastic);            // # hadElastic scatters along the beam-proton lineage
+    out->Branch("n_inelastic", &n_inelastic);        // 1 if that lineage ends in a protonInelastic breakup
+
+    Long64_t nev = t->GetEntries();
+    for (Long64_t i = 0; i < nev; i++) {
+        delete superevt; superevt = 0;          // EXTREMELY IMPORTANT (per WCSim examples)
+        t->GetEntry(i);
+        WCSimRootTrigger* trig = superevt->GetTrigger(0);
+
+        hit_pmt_charges.clear(); hit_pmt_calibrated_times.clear();
+        hit_x.clear(); hit_y.clear(); hit_z.clear();
+        hit_tube.clear(); hit_mpmt_slot_ids.clear(); hit_pmt_position_ids.clear();
+        hit_track_id.clear();
+        event_number = (int)i;
+
+        // --- truth: vertex + first primary track ---
+        vtx_x = trig->GetVtx(0); vtx_y = trig->GetVtx(1) + kWCSimToWCTE_Yoffset_cm; vtx_z = trig->GetVtx(2);
+        true_E = true_p = true_ke = true_length = -1; true_pdg = 0;
+        dir_x = dir_y = dir_z = 0;
+        start_x = start_y = start_z = stop_x = stop_y = stop_z = 0;
+        true_stopvol = -999; true_exit_ke = -1;
+        int primId = -999;
+        int ntrack = trig->GetNtrack();
+        for (int it = 0; it < ntrack; it++) {
+            WCSimRootTrack* tr = dynamic_cast<WCSimRootTrack*>(trig->GetTracks()->At(it));
+            if (!tr) continue;
+            // beam primary: Parenttype 0 and Flag 0 (skip WCSim's flag -1/-2
+            // incident/target pseudo-tracks, which have m=0 and a far-upstream start)
+            if (tr->GetParenttype() == 0 && tr->GetFlag() == 0) {
+                primId   = tr->GetId();
+                true_E   = tr->GetE();
+                true_p   = tr->GetP();
+                true_ke  = tr->GetE() - tr->GetM();
+                true_pdg = tr->GetIpnu();
+                dir_x = tr->GetDir(0); dir_y = tr->GetDir(1); dir_z = tr->GetDir(2);
+                start_x = tr->GetStart(0); start_y = tr->GetStart(1) + kWCSimToWCTE_Yoffset_cm; start_z = tr->GetStart(2);
+                stop_x  = tr->GetStop(0);  stop_y  = tr->GetStop(1) + kWCSimToWCTE_Yoffset_cm;  stop_z  = tr->GetStop(2);
+                true_length = std::sqrt((stop_x-start_x)*(stop_x-start_x) +
+                                        (stop_y-start_y)*(stop_y-start_y) +
+                                        (stop_z-start_z)*(stop_z-start_z));
+                true_stopvol = tr->GetStopvol();
+                true_exit_ke = -1;                    // KE at the ID-edge (blacksheet) crossing
+                {
+                    std::vector<int>   bt = tr->GetBoundaryTypes();
+                    std::vector<float> bk = tr->GetBoundaryKEs();
+                    for (size_t k = 0; k < bt.size() && k < bk.size(); k++)
+                        if (bt[k] == 1) true_exit_ke = bk[k];   // keep the last blacksheet crossing
+                }
+                break;
+            }
+        }
+
+        // --- primary's direct daughters: process at/along the track ---
+        stop_process = ""; had_inelastic = 0; had_elastic = 0; n_prim_daughters = 0;
+        n_elastic = 0; n_inelastic = 0;
+        // true PMT hits per creating track: parentSavedTrackID -> count
+        std::map<int,int> hitsByParent;
+        for (int ih = 0; ih < trig->GetNcherenkovhittimes(); ih++) {
+            WCSimRootCherenkovHitTime* ht =
+                dynamic_cast<WCSimRootCherenkovHitTime*>(trig->GetCherenkovHitTimes()->At(ih));
+            if (ht) hitsByParent[ht->GetParentSavedTrackID()]++;
+        }
+        float best_d2 = 1e18f;   // pick the hadronic daughter nearest the primary stop
+        if (primId != -999) {
+            for (int it = 0; it < ntrack; it++) {
+                WCSimRootTrack* tr = dynamic_cast<WCSimRootTrack*>(trig->GetTracks()->At(it));
+                if (!tr || tr->GetParentId() != primId || tr->GetFlag() != 0) continue;
+                std::string proc = tr->GetCreatorProcessName();
+                float dsx = tr->GetStart(0), dsy = tr->GetStart(1) + kWCSimToWCTE_Yoffset_cm, dsz = tr->GetStart(2);
+                n_prim_daughters++;
+                bool inel = proc.find("Inelastic") != std::string::npos;
+                bool elas = (proc == "hadElastic");
+                bool decy = (proc == "Decay");
+                bool capt = proc.find("CaptureAtRest") != std::string::npos;
+                if (inel) had_inelastic = 1;
+                if (elas) had_elastic = 1;
+                if (inel || elas || decy || capt) {   // discrete fate: keep the one at the stop
+                    float d2 = (dsx-stop_x)*(dsx-stop_x) + (dsy-stop_y)*(dsy-stop_y) +
+                               (dsz-stop_z)*(dsz-stop_z);
+                    if (d2 < best_d2) { best_d2 = d2; stop_process = proc; }
+                }
+            }
+        }
+
+        // --- every saved track in the event (primary + all its saved
+        // descendants at any depth), independent of the direct-daughters
+        // loop above which only looks at the primary's immediate fate ---
+        track_id.clear(); track_parent_id.clear(); track_pdg.clear(); track_nhits.clear();
+        track_process.clear(); track_ke.clear();
+        track_start_x.clear(); track_start_y.clear(); track_start_z.clear();
+        track_end_x.clear();   track_end_y.clear();   track_end_z.clear();
+        track_dir_x.clear();   track_dir_y.clear();   track_dir_z.clear();
+        for (int it = 0; it < ntrack; it++) {
+            WCSimRootTrack* tr = dynamic_cast<WCSimRootTrack*>(trig->GetTracks()->At(it));
+            if (!tr || tr->GetFlag() != 0) continue;   // skip WCSim's -1/-2 incident/target pseudo-tracks
+            int tid = tr->GetId();
+            track_id.push_back(tid);
+            track_parent_id.push_back(tr->GetParentId());
+            track_pdg.push_back(tr->GetIpnu());
+            track_process.push_back(tr->GetCreatorProcessName());
+            track_ke.push_back(tr->GetE() - tr->GetM());
+            track_start_x.push_back(tr->GetStart(0)); track_start_y.push_back(tr->GetStart(1) + kWCSimToWCTE_Yoffset_cm); track_start_z.push_back(tr->GetStart(2));
+            track_end_x.push_back(tr->GetStop(0));    track_end_y.push_back(tr->GetStop(1) + kWCSimToWCTE_Yoffset_cm);    track_end_z.push_back(tr->GetStop(2));
+            track_dir_x.push_back(tr->GetDir(0)); track_dir_y.push_back(tr->GetDir(1)); track_dir_z.push_back(tr->GetDir(2));
+            track_nhits.push_back(hitsByParent.count(tid) ? hitsByParent[tid] : 0);
+        }
+
+        // --- follow the beam-particle lineage: elastic scatters, then breakup? ---
+        // Each track ends in ONE hard process; hadElastic spawns a scattered
+        // same-species continuation (take the highest-KE one), *Inelastic ends the
+        // chain. Follows the primary's own PDG (proton, kaon-, ...).
+        if (primId != -999) {
+            int cur = primId;
+            std::set<int> visited;
+            while (cur != -999 && !visited.count(cur)) {
+                visited.insert(cur);
+                int nextSame = -999; float bestKE = -1; bool curInelastic = false;
+                for (int it = 0; it < ntrack; it++) {
+                    WCSimRootTrack* tr = dynamic_cast<WCSimRootTrack*>(trig->GetTracks()->At(it));
+                    if (!tr || tr->GetParentId() != cur || tr->GetFlag() != 0) continue;
+                    std::string proc = tr->GetCreatorProcessName();
+                    if (proc.find("Inelastic") != std::string::npos) {
+                        curInelastic = true;
+                    } else if (proc == "hadElastic" && tr->GetIpnu() == true_pdg) {
+                        float ke = tr->GetE() - tr->GetM();     // scattered beam particle = highest KE
+                        if (ke > bestKE) { bestKE = ke; nextSame = tr->GetId(); }
+                    }
+                }
+                if (curInelastic) { n_inelastic++; break; }     // chain ends in breakup
+                if (nextSame != -999) { n_elastic++; cur = nextSame; }  // elastic -> continue
+                else break;                                     // ranged out / decayed / captured
+            }
+        }
+
+        // --- Cherenkov emission endpoint of the primary (photon pos: mm -> cm) ---
+        cher_end_len = -1; cher_end_x = cher_end_y = cher_end_z = 0; cher_n_prim = 0;
+        if (primId != -999) {
+            float best_s = -1e18f;
+            int nht = trig->GetNcherenkovhittimes();
+            for (int ih = 0; ih < nht; ih++) {
+                WCSimRootCherenkovHitTime* ht =
+                    dynamic_cast<WCSimRootCherenkovHitTime*>(trig->GetCherenkovHitTimes()->At(ih));
+                if (!ht || ht->GetParentSavedTrackID() != primId) continue;
+                float px = ht->GetPhotonStartPos(0) * 0.1f;   // mm -> cm
+                float py = ht->GetPhotonStartPos(1) * 0.1f + kWCSimToWCTE_Yoffset_cm;
+                float pz = ht->GetPhotonStartPos(2) * 0.1f;
+                float s = (px-start_x)*dir_x + (py-start_y)*dir_y + (pz-start_z)*dir_z;
+                cher_n_prim++;
+                if (s > best_s) { best_s = s; cher_end_x = px; cher_end_y = py; cher_end_z = pz; }
+            }
+            if (cher_n_prim > 0) cher_end_len = best_s;
+        }
+
+        // --- digitized hits + PMT positions ---
+        int ndigi = trig->GetNcherenkovdigihits();
+        for (int idigi = 0; idigi < ndigi; idigi++) {
+            WCSimRootCherenkovDigiHit* dh =
+                dynamic_cast<WCSimRootCherenkovDigiHit*>(trig->GetCherenkovDigiHits()->At(idigi));
+            if (!dh) continue;
+            int tubeId = dh->GetTubeId();
+            WCSimRootPMT pmt = geo->GetPMT(tubeId - 1);
+            hit_pmt_charges.push_back(dh->GetQ());
+            hit_pmt_calibrated_times.push_back(dh->GetT());
+            hit_x.push_back(pmt.GetPosition(0));
+            hit_y.push_back(pmt.GetPosition(1) + kWCSimToWCTE_Yoffset_cm);
+            hit_z.push_back(pmt.GetPosition(2));
+            hit_tube.push_back(tubeId);
+            hit_mpmt_slot_ids.push_back(pmt.GetmPMTNo());
+            hit_pmt_position_ids.push_back(pmt.GetmPMT_PMTNo() - 1); // 1-indexed -> WCTE 0-indexed
+
+            // truth-match: which track's Cherenkov photon produced this digit?
+            // a digihit can combine several true photon hits (pileup within the
+            // digitization window / dark noise); take the parent track of the
+            // first (earliest-indexed) contributing true hit as a representative value.
+            int trackId = -999;
+            std::vector<int> photonIds = dh->GetPhotonIds();
+            if (!photonIds.empty()) {
+                WCSimRootCherenkovHitTime* ht =
+                    dynamic_cast<WCSimRootCherenkovHitTime*>(trig->GetCherenkovHitTimes()->At(photonIds[0]));
+                if (ht) trackId = ht->GetParentSavedTrackID();   // -1 = dark noise
+            }
+            hit_track_id.push_back(trackId);
+        }
+        n_digihits = (int)hit_pmt_charges.size();
+        out->Fill();
+    }
+
+    fout->cd();
+    out->Write();
+    fout->Close();
+    f->Close();
+    printf("Wrote %lld events to %s\n", nev, foutname);
+}
