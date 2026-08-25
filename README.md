@@ -19,6 +19,9 @@ code, `examples/` for notebooks) to make that merge easier later.
   ```
 - `analysis_tools/read_flatten_root_file.C` - basic template macro
   demonstrating how to read every branch of the flattened tree.
+- `analysis_tools/read_data_root_file.C` - basic template macro demonstrating
+  how to read every branch of the real merged WCTE data file
+  (`WCTEReadoutWindows` plus the single-entry summary trees).
 - `examples/compare_sim_data.ipynb` - template notebook comparing a flattened
   simulation file against real merged WCTE data: loads/selects muons from data
   the standard way (`analysis_tools.DataLoader` + `BeamSelection`), applies
