@@ -37,6 +37,23 @@ code, `examples/` for notebooks) to make that merge easier later.
   files predate recent schema changes.
 - No automated tests yet.
 - Not yet merged into `analysis_tools`; branch/file names may still change.
+- **MDT-processed files** (`*_MDT.root`, produced by the separate
+  [MDT](https://github.com/hyperk/MDT) tool - Merging/Digitizing/Triggering,
+  downstream of raw WCSim output) currently fail to flatten cleanly: some
+  digihits carry a `TubeId` far outside the file's own geometry (e.g. index
+  ~78865 into a 1644/1844-PMT array), which used to crash `flatten_wcsim.C`
+  outright via an out-of-bounds `TClonesArray::At`. Investigated so far:
+  MDT's own source passes `TubeId` through **unmodified** from the input
+  WCSim file (`WCRootData.cc:89,363-368` - no merged/global re-encoding), and
+  its `wcsimGeoT` output is a byte-for-byte copy of the input geometry (not
+  trimmed) - so the mismatch isn't explained by either of those. One untested
+  lead: `parameter/MDTParamenter_WCTE.txt` hardcodes the nominal full-WCTE
+  `MaxTubeID` (2014) regardless of the actual run's PMT count, which could be
+  involved in dark-noise hit generation. `flatten_wcsim.C` now skips any hit
+  with `TubeId` outside `[1, geo->GetWCNumPMT()]` instead of crashing, and
+  prints a count + sample of the bad values at the end - rerun inside the
+  container to get real numbers for further diagnosis. Plain (non-MDT)
+  WCSim output is unaffected.
 
 ## Notebook outputs
 

@@ -38,6 +38,14 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
     // like the rest of the analysis (x and z are unaffected).
     const float kWCSimToWCTE_Yoffset_cm = 42.47625f;
 
+    // Diagnostic for hits whose TubeId falls outside this file's own geometry
+    // (seen on MDT-processed inputs - see README "Status / known gaps"). Rather than
+    // crash into an out-of-bounds TClonesArray lookup, skip the hit and keep
+    // a small sample of the offending values to report at the end.
+    int nBadTubeId = 0;
+    std::set<int> badTubeIdSamples;
+    const int kMaxBadTubeIdSamples = 20;
+
     // hit_pmt_charges / hit_pmt_calibrated_times use the real WCTE data's
     // branch names + type (double) instead of WCSim's native float, so this
     // tree can be read with the same code as WCTE_merged_production_*.root.
@@ -330,6 +338,11 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
                 dynamic_cast<WCSimRootCherenkovDigiHit*>(trig->GetCherenkovDigiHits()->At(idigi));
             if (!dh) continue;
             int tubeId = dh->GetTubeId();
+            if (tubeId < 1 || tubeId > geo->GetWCNumPMT()) {
+                nBadTubeId++;
+                if ((int)badTubeIdSamples.size() < kMaxBadTubeIdSamples) badTubeIdSamples.insert(tubeId);
+                continue;   // don't index geo->GetPMT() out of bounds
+            }
             WCSimRootPMT pmt = geo->GetPMT(tubeId - 1);
             hit_pmt_charges.push_back(dh->GetQ());
             hit_pmt_calibrated_times.push_back(dh->GetT());
@@ -362,4 +375,10 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
     fout->Close();
     f->Close();
     printf("Wrote %lld events to %s\n", nev, foutname);
+    if (nBadTubeId > 0) {
+        printf("WARNING: skipped %d digihit(s) with TubeId outside [1,%d] (this file's PMT count). Sample bad values: ",
+               nBadTubeId, geo->GetWCNumPMT());
+        for (int v : badTubeIdSamples) printf("%d ", v);
+        printf("\n");
+    }
 }
