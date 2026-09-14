@@ -6,13 +6,34 @@
 //
 // Run inside the container:
 //   root -l -b -q 'flatten_wcsim.C("wcsim.root","flat.root")'
+//
+// isMDT: -1 (default) = auto-detect whether `fname` is raw WCSim output or has
+// been through the MDT (Merging/Digitizing/Triggering, https://github.com/hyperk/MDT)
+// tool; 0 = force raw-WCSim truth-matching; 1 = force MDT truth-matching. See
+// DetectIsMDT() and the digihit truth-match block below for why this matters:
+// MDT's own digitizer (HitDigitizer.cc) repurposes WCSimRootCherenkovDigiHit's
+// photon-id field to carry the true parent TRACK ID directly, instead of an
+// index into trig->GetCherenkovHitTimes() like raw WCSim - using the wrong
+// interpretation silently collapses hit_track_id onto ~1 track per event
+// (small track-id values misread as small, "successful" array indices).
 R__LOAD_LIBRARY($WCSIM_BUILD_DIR/lib/libWCSimRoot.so)
 #include <map>
 #include <set>
 #include <cmath>
 #include <algorithm>
 
-void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
+// Raw WCSim writes separate "wcsimrootevent2" / "wcsimrootevent_OD" branches in
+// wcsimT alongside "wcsimrootevent" (second/OD detector copies); MDT's own
+// WCRootData::CreateTree, run with its default (single-detector) branch list,
+// writes only "wcsimrootevent". Checked on both plain and MDT-processed pi-/mu-
+// samples in this analysis; not guaranteed for every possible MDT/WCSim
+// configuration, hence the isMDT override above.
+bool DetectIsMDT(TTree* t)
+{
+    return t->GetBranch("wcsimrootevent_OD") == nullptr;
+}
+
+void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t isMDT = -1)
 {
     TFile* f = TFile::Open(fname);
     if (!f || !f->IsOpen()) { printf("ERROR: cannot open %s\n", fname); return; }
@@ -20,6 +41,10 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
     TTree* t = (TTree*)f->Get("wcsimT");
     WCSimRootEvent* superevt = new WCSimRootEvent();
     t->SetBranchAddress("wcsimrootevent", &superevt);
+
+    bool useMDTTruth = (isMDT < 0) ? DetectIsMDT(t) : (isMDT != 0);
+    printf("flatten_wcsim: %s input as %s (pass isMDT=0/1 to override)\n",
+           (isMDT < 0) ? "auto-detected" : "forced", useMDTTruth ? "MDT-processed" : "plain WCSim");
 
     WCSimRootGeom* geo = 0;
     TTree* geotree = (TTree*)f->Get("wcsimGeoT");
@@ -46,11 +71,12 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
     std::set<int> badTubeIdSamples;
     const int kMaxBadTubeIdSamples = 20;
 
-    // Same issue as above, but for the photon-id index a digihit uses to look
-    // up its true Cherenkov hit time (dh->GetPhotonIds()[0]): on MDT-processed
-    // inputs this can also come back pointing outside trig->GetCherenkovHitTimes().
-    // Skip the truth match for that hit (hit_track_id stays -999) instead of
-    // crashing into an out-of-bounds TClonesArray lookup.
+    // Diagnostic for the plain-WCSim truth-match path only (useMDTTruth==false):
+    // dh->GetPhotonIds()[0] is supposed to index trig->GetCherenkovHitTimes(),
+    // but can come back pointing outside it. Skip the truth match for that hit
+    // (hit_track_id stays -999) instead of crashing into an out-of-bounds
+    // TClonesArray lookup. Never triggers in MDT mode (see useMDTTruth below -
+    // no array lookup happens there).
     int nBadPhotonId = 0;
     std::set<int> badPhotonIdSamples;
     const int kMaxBadPhotonIdSamples = 20;
@@ -366,17 +392,30 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
             // a digihit can combine several true photon hits (pileup within the
             // digitization window / dark noise); take the parent track of the
             // first (earliest-indexed) contributing true hit as a representative value.
+            //
+            // The two producers disagree on what dh->GetPhotonIds() actually holds:
+            //  - plain WCSim: indices into trig->GetCherenkovHitTimes() - look the
+            //    entry up and read ITS GetParentSavedTrackID().
+            //  - MDT (HitDigitizer.cc's parent_composition, built from
+            //    TrueHit::GetParentId()): the true parent TRACK ID itself, already -
+            //    no CherenkovHitTimes lookup needed (or valid: that array is laid
+            //    out differently in MDT output, indexed per-tube-across-the-whole
+            //    -event, not addressable by these ids at all).
             int trackId = -999;
             std::vector<int> photonIds = dh->GetPhotonIds();
             if (!photonIds.empty()) {
-                int photonId = photonIds[0];
-                if (photonId < 0 || photonId >= trig->GetNcherenkovhittimes()) {
-                    nBadPhotonId++;
-                    if ((int)badPhotonIdSamples.size() < kMaxBadPhotonIdSamples) badPhotonIdSamples.insert(photonId);
+                if (useMDTTruth) {
+                    trackId = photonIds[0];   // already a track id; -1 = dark noise (MDT's own convention)
                 } else {
-                    WCSimRootCherenkovHitTime* ht =
-                        dynamic_cast<WCSimRootCherenkovHitTime*>(trig->GetCherenkovHitTimes()->At(photonId));
-                    if (ht) trackId = ht->GetParentSavedTrackID();   // -1 = dark noise
+                    int photonId = photonIds[0];
+                    if (photonId < 0 || photonId >= trig->GetNcherenkovhittimes()) {
+                        nBadPhotonId++;
+                        if ((int)badPhotonIdSamples.size() < kMaxBadPhotonIdSamples) badPhotonIdSamples.insert(photonId);
+                    } else {
+                        WCSimRootCherenkovHitTime* ht =
+                            dynamic_cast<WCSimRootCherenkovHitTime*>(trig->GetCherenkovHitTimes()->At(photonId));
+                        if (ht) trackId = ht->GetParentSavedTrackID();   // -1 = dark noise
+                    }
                 }
             }
             hit_track_id.push_back(trackId);

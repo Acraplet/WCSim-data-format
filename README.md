@@ -54,17 +54,32 @@ code, `examples/` for notebooks) to make that merge easier later.
   prints a count + sample of the bad values at the end - rerun inside the
   container to get real numbers for further diagnosis. Plain (non-MDT)
   WCSim output is unaffected.
-- Same MDT indexing issue, second instance: a digihit's `GetPhotonIds()[0]`
-  (used to look up its true Cherenkov hit time for the `hit_track_id` truth
-  match) can also come back pointing outside `trig->GetCherenkovHitTimes()`
-  on MDT-processed files (e.g. index ~79403 into a 1662-entry array), which
-  used to spam `Error in <TClonesArray::At>: index ... out of bounds` (a
-  ROOT-level error, not a crash - the resulting null pointer was already
-  handled by the existing `if (ht)` check, so `hit_track_id` silently stayed
-  `-999` for those hits). `flatten_wcsim.C` now bounds-checks this index the
-  same way as `TubeId`, skipping just the truth match for the offending
-  digihit and reporting a count + sample of bad values at the end instead of
-  hitting the ROOT error.
+- **`hit_track_id` on MDT-processed files was reading the wrong field
+  entirely**, not just occasionally out-of-bounds. `flatten_wcsim.C` (like the
+  official WCSim examples) assumed `dh->GetPhotonIds()[0]` is an index into
+  `trig->GetCherenkovHitTimes()`, which is true for plain WCSim output but not
+  for MDT: MDT's own digitizer
+  ([`HitDigitizer.cc`](https://github.com/hyperk/MDT/blob/angular_response_gain/cpp/src/HitDigitizer.cc),
+  `parent_composition.push_back(PEs[iPE]->GetParentId())`) writes the true
+  parent **track ID directly** into that same field
+  ([`WCRootData.cc`](https://github.com/hyperk/MDT/blob/angular_response_gain/app/utilities/WCRootData/src/WCRootData.cc),
+  `true_pe_comp = aPH->GetParentCompositionDigi(i)` passed straight to
+  `AddCherenkovDigiHit`). Treating a track ID as an array index either throws
+  `Error in <TClonesArray::At>: index ... out of bounds` (large track IDs,
+  e.g. ~79403 into a 1662-entry array) or "succeeds" by accident on small
+  track IDs (e.g. 1, 2, 3 - common ones, since low IDs tend to be the primary
+  and early secondaries) and returns an unrelated hit's parent track - which
+  is why `hit_track_id` on MDT files looked collapsed onto ~1 dominant track
+  per event instead of the real per-hit diversity seen on plain WCSim output.
+  `flatten_wcsim.C` now takes an `isMDT` argument (default `-1` = auto-detect,
+  via `DetectIsMDT()`: plain WCSim writes `wcsimrootevent2`/`wcsimrootevent_OD`
+  branches in `wcsimT` alongside `wcsimrootevent`, MDT (run with its default
+  branch list) writes only `wcsimrootevent` - checked on both plain and
+  MDT-processed pi-/mu- samples here, but pass `isMDT=0`/`1` explicitly if a
+  file doesn't match this pattern) and uses `photonIds[0]` directly as the
+  track id in MDT mode, with no `CherenkovHitTimes` lookup at all. The
+  `nBadPhotonId` bounds-check diagnostic below only applies to (and only fires
+  in) plain-WCSim mode.
 
 ## Notebook outputs
 
