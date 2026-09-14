@@ -54,6 +54,17 @@ code, `examples/` for notebooks) to make that merge easier later.
   prints a count + sample of the bad values at the end - rerun inside the
   container to get real numbers for further diagnosis. Plain (non-MDT)
   WCSim output is unaffected.
+- Same MDT indexing issue, second instance: a digihit's `GetPhotonIds()[0]`
+  (used to look up its true Cherenkov hit time for the `hit_track_id` truth
+  match) can also come back pointing outside `trig->GetCherenkovHitTimes()`
+  on MDT-processed files (e.g. index ~79403 into a 1662-entry array), which
+  used to spam `Error in <TClonesArray::At>: index ... out of bounds` (a
+  ROOT-level error, not a crash - the resulting null pointer was already
+  handled by the existing `if (ht)` check, so `hit_track_id` silently stayed
+  `-999` for those hits). `flatten_wcsim.C` now bounds-checks this index the
+  same way as `TubeId`, skipping just the truth match for the offending
+  digihit and reporting a count + sample of bad values at the end instead of
+  hitting the ROOT error.
 
 ## Notebook outputs
 

@@ -46,6 +46,15 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
     std::set<int> badTubeIdSamples;
     const int kMaxBadTubeIdSamples = 20;
 
+    // Same issue as above, but for the photon-id index a digihit uses to look
+    // up its true Cherenkov hit time (dh->GetPhotonIds()[0]): on MDT-processed
+    // inputs this can also come back pointing outside trig->GetCherenkovHitTimes().
+    // Skip the truth match for that hit (hit_track_id stays -999) instead of
+    // crashing into an out-of-bounds TClonesArray lookup.
+    int nBadPhotonId = 0;
+    std::set<int> badPhotonIdSamples;
+    const int kMaxBadPhotonIdSamples = 20;
+
     // hit_pmt_charges / hit_pmt_calibrated_times use the real WCTE data's
     // branch names + type (double) instead of WCSim's native float, so this
     // tree can be read with the same code as WCTE_merged_production_*.root.
@@ -360,9 +369,15 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
             int trackId = -999;
             std::vector<int> photonIds = dh->GetPhotonIds();
             if (!photonIds.empty()) {
-                WCSimRootCherenkovHitTime* ht =
-                    dynamic_cast<WCSimRootCherenkovHitTime*>(trig->GetCherenkovHitTimes()->At(photonIds[0]));
-                if (ht) trackId = ht->GetParentSavedTrackID();   // -1 = dark noise
+                int photonId = photonIds[0];
+                if (photonId < 0 || photonId >= trig->GetNcherenkovhittimes()) {
+                    nBadPhotonId++;
+                    if ((int)badPhotonIdSamples.size() < kMaxBadPhotonIdSamples) badPhotonIdSamples.insert(photonId);
+                } else {
+                    WCSimRootCherenkovHitTime* ht =
+                        dynamic_cast<WCSimRootCherenkovHitTime*>(trig->GetCherenkovHitTimes()->At(photonId));
+                    if (ht) trackId = ht->GetParentSavedTrackID();   // -1 = dark noise
+                }
             }
             hit_track_id.push_back(trackId);
         }
@@ -379,6 +394,12 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root")
         printf("WARNING: skipped %d digihit(s) with TubeId outside [1,%d] (this file's PMT count). Sample bad values: ",
                nBadTubeId, geo->GetWCNumPMT());
         for (int v : badTubeIdSamples) printf("%d ", v);
+        printf("\n");
+    }
+    if (nBadPhotonId > 0) {
+        printf("WARNING: skipped truth-match for %d digihit(s) with a photon id outside this trigger's "
+               "CherenkovHitTimes array. Sample bad values: ", nBadPhotonId);
+        for (int v : badPhotonIdSamples) printf("%d ", v);
         printf("\n");
     }
 }
