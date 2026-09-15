@@ -19,8 +19,10 @@
 R__LOAD_LIBRARY($WCSIM_BUILD_DIR/lib/libWCSimRoot.so)
 #include <map>
 #include <set>
+#include <string>
 #include <cmath>
 #include <algorithm>
+#include "TKey.h"
 
 // Raw WCSim writes separate "wcsimrootevent2" / "wcsimrootevent_OD" branches in
 // wcsimT alongside "wcsimrootevent" (second/OD detector copies); MDT's own
@@ -426,6 +428,32 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
 
     fout->cd();
     out->Write();
+
+    // Copy every other TTree in the input file to the output unchanged
+    // (byte-for-byte, no reprocessing) - e.g. "AllSecondaries",
+    // "AllSecondaryPhotons", "Settings", "wcsimGeoT", "wcsimRootOptionsT" -
+    // so the flat file also carries whatever else WCSim wrote, exactly as
+    // it wrote it. Skips "wcsimT" itself, which is what "hits" above was
+    // built from. Each tree name is only copied once even though ROOT
+    // lists one key per write cycle (e.g. "AllSecondaries;1" and ";2");
+    // f->Get(name) always returns the latest cycle.
+    std::set<std::string> copiedTreeNames;
+    TIter nextkey(f->GetListOfKeys());
+    TKey* key;
+    while ((key = (TKey*)nextkey())) {
+        if (std::string(key->GetClassName()) != "TTree") continue;
+        std::string treeName = key->GetName();
+        if (treeName == "wcsimT" || copiedTreeNames.count(treeName)) continue;
+        copiedTreeNames.insert(treeName);
+        TTree* srcTree = (TTree*)f->Get(treeName.c_str());
+        if (!srcTree) continue;
+        fout->cd();
+        TTree* treeCopy = srcTree->CloneTree(-1, "fast");
+        treeCopy->Write();
+        printf("flatten_wcsim: copied tree '%s' unchanged (%lld entries)\n",
+               treeName.c_str(), treeCopy->GetEntries());
+    }
+
     fout->Close();
     f->Close();
     printf("Wrote %lld events to %s\n", nev, foutname);
