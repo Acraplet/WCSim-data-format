@@ -21,8 +21,9 @@ R__LOAD_LIBRARY($WCSIM_BUILD_DIR/lib/libWCSimRoot.so)
 #include <set>
 #include <string>
 #include <cmath>
-#include <algorithm>
 #include "TKey.h"
+#include "TStreamerInfo.h"
+#include "TStreamerElement.h"
 
 // Raw WCSim writes separate "wcsimrootevent2" / "wcsimrootevent_OD" branches in
 // wcsimT alongside "wcsimrootevent" (second/OD detector copies); MDT's own
@@ -52,6 +53,32 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
     TTree* geotree = (TTree*)f->Get("wcsimGeoT");
     geotree->SetBranchAddress("wcsimrootgeom", &geo);
     geotree->GetEntry(0);
+
+    // Does THIS FILE's own WCSimRootTrack layout include the "largest
+    // scatter" fields (added to WCSim after this flattener was first
+    // written)? Checked from the file's embedded TStreamerInfo rather than
+    // just calling the getters, so older files (written before that WCSim
+    // change) are read fine even though the getters themselves always exist
+    // in whatever (current) WCSim library this macro is compiled against -
+    // ROOT's own schema evolution would already default them safely, but
+    // this makes the fallback explicit and printed instead of silent.
+    bool hasMaxScatterInfo = false;
+    {
+        TList* streamerInfoList = f->GetStreamerInfoList();
+        TStreamerInfo* si = streamerInfoList ? (TStreamerInfo*)streamerInfoList->FindObject("WCSimRootTrack") : nullptr;
+        if (si && si->GetElements() && si->GetElements()->FindObject("fMaxScatterAngleDeg")) {
+            hasMaxScatterInfo = true;
+        }
+        if (hasMaxScatterInfo) {
+            printf("flatten_wcsim: input file has the largest-scatter track fields - filling true_max_scatter_*\n");
+        } else {
+            printf("flatten_wcsim: NOTE - this information is not available because %s was produced with an "
+                   "older WCSim container/build that predates the largest-scatter tracking feature "
+                   "(no 'fMaxScatterAngleDeg' field in its WCSimRootTrack). "
+                   "true_max_scatter_* branches will be filled with their default/sentinel values "
+                   "(-1 / \"\" / 0) for every event in this file.\n", fname);
+        }
+    }
 
     TFile* fout = new TFile(foutname, "RECREATE");
     TTree* out  = new TTree("hits", "flattened WCSim digihits with geometry + truth");
@@ -103,15 +130,6 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
     std::vector<int>   hit_track_id;
     int   n_digihits = 0, true_pdg = 0, event_number = 0;
     float true_E = -1, true_p = -1, true_ke = -1, true_length = -1;
-    // true_deflection_angle [degrees]: angle between the primary's INITIAL
-    // direction (true_dir_*) and the straight-line chord from true_start_*
-    // to true_stop_*. A cheap, whole-track proxy for "how much did this
-    // track bend end-to-end" - NOT per-scatter truth (no timing/location of
-    // individual scatters, since Geant4 multiple/Coulomb scattering doesn't
-    // create separate tracks the way hadronic elastic/inelastic does; see
-    // the README). 0 = dead straight; -1 = undefined (zero-length chord,
-    // e.g. the primary stopped right where it started, or wasn't found).
-    float true_deflection_angle = -1;
     float vtx_x = 0, vtx_y = 0, vtx_z = 0, dir_x = 0, dir_y = 0, dir_z = 0;
     float start_x = 0, start_y = 0, start_z = 0, stop_x = 0, stop_y = 0, stop_z = 0;
 
@@ -151,6 +169,20 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
     // a protonInelastic breakup (so n_elastic>0 & n_inelastic==1 = elastic-then-inelastic).
     int   n_elastic = 0, n_inelastic = 0;
 
+    // --- largest single-step deflection ("scatter") along the primary track,
+    // from WCSimRootTrack::GetMaxScatter* (see WCSimTrajectory::AppendStep in
+    // the sim). -1 / "" = no primary found or the primary took no steps. This
+    // is a genuine per-step (not whole-track chord) deflection: a discrete
+    // process (hadElastic, *Inelastic, ...) shows up as one step with a large
+    // angle, while continuous msc is spread over many small-angle steps.
+    float true_max_scatter_angle_deg = -1;
+    std::string true_max_scatter_process = "";
+    float true_max_scatter_x = 0, true_max_scatter_y = 0, true_max_scatter_z = 0;
+    float true_max_scatter_predir_x = 0, true_max_scatter_predir_y = 0, true_max_scatter_predir_z = 0;
+    float true_max_scatter_postdir_x = 0, true_max_scatter_postdir_y = 0, true_max_scatter_postdir_z = 0;
+    float true_max_scatter_ke_pre = -1, true_max_scatter_ke_post = -1;
+    int   true_n_scatters_above_7deg = 0;
+
     out->Branch("hit_pmt_charges", &hit_pmt_charges);
     out->Branch("hit_pmt_calibrated_times", &hit_pmt_calibrated_times);
     out->Branch("hit_x", &hit_x);
@@ -167,7 +199,6 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
     out->Branch("true_p", &true_p);              // momentum [MeV/c]
     out->Branch("true_ke", &true_ke);            // kinetic energy [MeV]
     out->Branch("true_length", &true_length);    // track length start->stop [cm]
-    out->Branch("true_deflection_angle", &true_deflection_angle);  // angle [deg] between true_dir_* and the start->stop chord (-1 = undefined)
     out->Branch("true_vtx_x", &vtx_x);
     out->Branch("true_vtx_y", &vtx_y);
     out->Branch("true_vtx_z", &vtx_z);
@@ -208,6 +239,20 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
     out->Branch("true_exit_ke", &true_exit_ke);      // KE at ID-edge crossing [MeV] (-1 = ranged out inside)
     out->Branch("n_elastic", &n_elastic);            // # hadElastic scatters along the beam-proton lineage
     out->Branch("n_inelastic", &n_inelastic);        // 1 if that lineage ends in a protonInelastic breakup
+    out->Branch("true_max_scatter_angle_deg", &true_max_scatter_angle_deg);  // largest single-step deflection along the primary [deg] (-1 = none)
+    out->Branch("true_max_scatter_process", &true_max_scatter_process);     // process that defined that step
+    out->Branch("true_max_scatter_x", &true_max_scatter_x);  // position of that step [cm]
+    out->Branch("true_max_scatter_y", &true_max_scatter_y);
+    out->Branch("true_max_scatter_z", &true_max_scatter_z);
+    out->Branch("true_max_scatter_predir_x", &true_max_scatter_predir_x);   // track direction just before that step (unit vector)
+    out->Branch("true_max_scatter_predir_y", &true_max_scatter_predir_y);
+    out->Branch("true_max_scatter_predir_z", &true_max_scatter_predir_z);
+    out->Branch("true_max_scatter_postdir_x", &true_max_scatter_postdir_x); // track direction just after that step (unit vector)
+    out->Branch("true_max_scatter_postdir_y", &true_max_scatter_postdir_y);
+    out->Branch("true_max_scatter_postdir_z", &true_max_scatter_postdir_z);
+    out->Branch("true_max_scatter_ke_pre", &true_max_scatter_ke_pre);   // KE just before that step [MeV]
+    out->Branch("true_max_scatter_ke_post", &true_max_scatter_ke_post); // KE just after that step [MeV]
+    out->Branch("true_n_scatters_above_7deg", &true_n_scatters_above_7deg); // # steps along the primary with deflection > 7 deg
 
     Long64_t nev = t->GetEntries();
     for (Long64_t i = 0; i < nev; i++) {
@@ -224,10 +269,15 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
         // --- truth: vertex + first primary track ---
         vtx_x = trig->GetVtx(0); vtx_y = trig->GetVtx(1) + kWCSimToWCTE_Yoffset_cm; vtx_z = trig->GetVtx(2);
         true_E = true_p = true_ke = true_length = -1; true_pdg = 0;
-        true_deflection_angle = -1;
         dir_x = dir_y = dir_z = 0;
         start_x = start_y = start_z = stop_x = stop_y = stop_z = 0;
         true_stopvol = -999; true_exit_ke = -1;
+        true_max_scatter_angle_deg = -1; true_max_scatter_process = "";
+        true_max_scatter_x = true_max_scatter_y = true_max_scatter_z = 0;
+        true_max_scatter_predir_x = true_max_scatter_predir_y = true_max_scatter_predir_z = 0;
+        true_max_scatter_postdir_x = true_max_scatter_postdir_y = true_max_scatter_postdir_z = 0;
+        true_max_scatter_ke_pre = true_max_scatter_ke_post = -1;
+        true_n_scatters_above_7deg = 0;
         int primId = -999;
         int ntrack = trig->GetNtrack();
         for (int it = 0; it < ntrack; it++) {
@@ -247,14 +297,6 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
                 true_length = std::sqrt((stop_x-start_x)*(stop_x-start_x) +
                                         (stop_y-start_y)*(stop_y-start_y) +
                                         (stop_z-start_z)*(stop_z-start_z));
-                if (true_length > 0) {
-                    float cx = (stop_x-start_x)/true_length;
-                    float cy = (stop_y-start_y)/true_length;
-                    float cz = (stop_z-start_z)/true_length;
-                    float cosang = dir_x*cx + dir_y*cy + dir_z*cz;
-                    cosang = std::max(-1.f, std::min(1.f, cosang));   // guard float rounding past [-1,1]
-                    true_deflection_angle = std::acos(cosang) * (180.0f / 3.14159265358979323846f);
-                }
                 true_stopvol = tr->GetStopvol();
                 true_exit_ke = -1;                    // KE at the ID-edge (blacksheet) crossing
                 {
@@ -262,6 +304,22 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
                     std::vector<float> bk = tr->GetBoundaryKEs();
                     for (size_t k = 0; k < bt.size() && k < bk.size(); k++)
                         if (bt[k] == 1) true_exit_ke = bk[k];   // keep the last blacksheet crossing
+                }
+                if (hasMaxScatterInfo) {
+                    true_max_scatter_angle_deg = tr->GetMaxScatterAngleDeg();
+                    true_max_scatter_process   = tr->GetMaxScatterProcess();
+                    true_max_scatter_x = tr->GetMaxScatterPos(0);
+                    true_max_scatter_y = tr->GetMaxScatterPos(1) + kWCSimToWCTE_Yoffset_cm;
+                    true_max_scatter_z = tr->GetMaxScatterPos(2);
+                    true_max_scatter_predir_x = tr->GetMaxScatterPreDir(0);
+                    true_max_scatter_predir_y = tr->GetMaxScatterPreDir(1);
+                    true_max_scatter_predir_z = tr->GetMaxScatterPreDir(2);
+                    true_max_scatter_postdir_x = tr->GetMaxScatterPostDir(0);
+                    true_max_scatter_postdir_y = tr->GetMaxScatterPostDir(1);
+                    true_max_scatter_postdir_z = tr->GetMaxScatterPostDir(2);
+                    true_max_scatter_ke_pre  = tr->GetMaxScatterKEPre();
+                    true_max_scatter_ke_post = tr->GetMaxScatterKEPost();
+                    true_n_scatters_above_7deg = tr->GetNScattersAbove7Deg();
                 }
                 break;
             }

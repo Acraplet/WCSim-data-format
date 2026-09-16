@@ -107,28 +107,6 @@ The tracks are stored as an array (similar to all the hits) and for each hit the
 track that produced it is stored in `hit_track_id`. The ID of the parent particle track is 
 stored in `track_parent_id` which allows us to trace the lineage of a given track. 
 
-### `true_deflection_angle`
-
-The angle (degrees) between the primary's initial direction (`true_dir_*`) and the
-straight-line chord from `true_start_*` to `true_stop_*`. This is a cheap, whole-track
-proxy for "how much did this track bend end-to-end" - **not** per-scatter truth: it
-carries no information about *where* along the track the bending happened, or whether
-it came from one big kink or many small ones. `0` means dead straight; `-1` means
-undefined (zero-length chord).
-
-In particular this does **not** let you distinguish continuous electromagnetic multiple
-scattering (`msc` - many tiny random-angle kicks smeared along the whole path, which in
-Geant4 deflects the *same* track in place rather than creating a new one) from a single
-large-angle interaction. Geant4 doesn't record per-step direction/process information
-for charged particles anywhere in the current WCSim output, so genuine per-scatter EM
-truth would require instrumenting WCSim's simulation source itself (extending
-`WCSimTrajectory`'s `AppendStep`, which already records per-step *positions* in memory
-for visualization but never writes them to ROOT) and rebuilding - out of scope here.
-
-For hadronic beam particles, a large, localized deflection is more reliably diagnosed
-via `had_elastic`/`n_elastic` (an actual `hadElastic` interaction, which *does* create a
-new track - see below) than via this angle alone.
-
 ### Hadronic-interaction flags: `had_inelastic`, `had_elastic`, `n_elastic`, `n_inelastic`
 
 These four fields all describe whether the *primary* particle underwent a hard hadronic
