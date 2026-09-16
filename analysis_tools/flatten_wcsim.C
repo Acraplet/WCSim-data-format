@@ -21,7 +21,6 @@ R__LOAD_LIBRARY($WCSIM_BUILD_DIR/lib/libWCSimRoot.so)
 #include <set>
 #include <string>
 #include <cmath>
-#include <algorithm>
 #include "TKey.h"
 #include "TStreamerInfo.h"
 #include "TStreamerElement.h"
@@ -131,15 +130,6 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
     std::vector<int>   hit_track_id;
     int   n_digihits = 0, true_pdg = 0, event_number = 0;
     float true_E = -1, true_p = -1, true_ke = -1, true_length = -1;
-    // true_deflection_angle [degrees]: angle between the primary's INITIAL
-    // direction (true_dir_*) and the straight-line chord from true_start_*
-    // to true_stop_*. A cheap, whole-track proxy for "how much did this
-    // track bend end-to-end" - NOT per-scatter truth (no timing/location of
-    // individual scatters, since Geant4 multiple/Coulomb scattering doesn't
-    // create separate tracks the way hadronic elastic/inelastic does; see
-    // the README). 0 = dead straight; -1 = undefined (zero-length chord,
-    // e.g. the primary stopped right where it started, or wasn't found).
-    float true_deflection_angle = -1;
     float vtx_x = 0, vtx_y = 0, vtx_z = 0, dir_x = 0, dir_y = 0, dir_z = 0;
     float start_x = 0, start_y = 0, start_z = 0, stop_x = 0, stop_y = 0, stop_z = 0;
 
@@ -209,7 +199,6 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
     out->Branch("true_p", &true_p);              // momentum [MeV/c]
     out->Branch("true_ke", &true_ke);            // kinetic energy [MeV]
     out->Branch("true_length", &true_length);    // track length start->stop [cm]
-    out->Branch("true_deflection_angle", &true_deflection_angle);  // angle [deg] between true_dir_* and the start->stop chord (-1 = undefined)
     out->Branch("true_vtx_x", &vtx_x);
     out->Branch("true_vtx_y", &vtx_y);
     out->Branch("true_vtx_z", &vtx_z);
@@ -280,7 +269,6 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
         // --- truth: vertex + first primary track ---
         vtx_x = trig->GetVtx(0); vtx_y = trig->GetVtx(1) + kWCSimToWCTE_Yoffset_cm; vtx_z = trig->GetVtx(2);
         true_E = true_p = true_ke = true_length = -1; true_pdg = 0;
-        true_deflection_angle = -1;
         dir_x = dir_y = dir_z = 0;
         start_x = start_y = start_z = stop_x = stop_y = stop_z = 0;
         true_stopvol = -999; true_exit_ke = -1;
@@ -309,14 +297,6 @@ void flatten_wcsim(const char* fname, const char* foutname = "flat.root", Int_t 
                 true_length = std::sqrt((stop_x-start_x)*(stop_x-start_x) +
                                         (stop_y-start_y)*(stop_y-start_y) +
                                         (stop_z-start_z)*(stop_z-start_z));
-                if (true_length > 0) {
-                    float cx = (stop_x-start_x)/true_length;
-                    float cy = (stop_y-start_y)/true_length;
-                    float cz = (stop_z-start_z)/true_length;
-                    float cosang = dir_x*cx + dir_y*cy + dir_z*cz;
-                    cosang = std::max(-1.f, std::min(1.f, cosang));   // guard float rounding past [-1,1]
-                    true_deflection_angle = std::acos(cosang) * (180.0f / 3.14159265358979323846f);
-                }
                 true_stopvol = tr->GetStopvol();
                 true_exit_ke = -1;                    // KE at the ID-edge (blacksheet) crossing
                 {

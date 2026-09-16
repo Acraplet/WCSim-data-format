@@ -77,7 +77,6 @@ void read_flatten_root_file()
     Float_t true_p        = -999; // true momentum magnitude (MeV/c)
     Float_t true_ke       = -999; // true kinetic energy (MeV)
     Float_t true_length   = -999; // true track length (cm)
-    Float_t true_deflection_angle = -999; // angle (deg) between true_dir_* and the start->stop chord (-1 = undefined)
     Float_t true_vtx_x    = -999; // true vertex position, x (cm)
     Float_t true_vtx_y    = -999; // true vertex position, y (cm)
     Float_t true_vtx_z    = -999; // true vertex position, z (cm)
@@ -142,7 +141,6 @@ void read_flatten_root_file()
     tree->SetBranchAddress("true_p",      &true_p);
     tree->SetBranchAddress("true_ke",     &true_ke);
     tree->SetBranchAddress("true_length", &true_length);
-    tree->SetBranchAddress("true_deflection_angle", &true_deflection_angle);
     tree->SetBranchAddress("true_vtx_x",  &true_vtx_x);
     tree->SetBranchAddress("true_vtx_y",  &true_vtx_y);
     tree->SetBranchAddress("true_vtx_z",  &true_vtx_z);
@@ -205,9 +203,7 @@ void read_flatten_root_file()
         std::cout << "  true stop point = ("
                    << true_stop_x << ", " << true_stop_y << ", " << true_stop_z
                    << ") cm"  << std::endl;
-        std::cout << "  true_length = " << true_length << " cm"
-                   << ", true_deflection_angle = " << true_deflection_angle << " deg"
-                   << std::endl;
+        std::cout << "  true_length = " << true_length << " cm" << std::endl;
         std::cout  << " number of elastic scatters = " << n_elastic 
                    << " number of inelastic scatters = " << n_inelastic
                    << std::endl;
