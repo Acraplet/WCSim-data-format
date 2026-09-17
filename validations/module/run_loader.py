@@ -12,11 +12,15 @@ from matplotlib.lines import Line2D
 import glob
 
 import awkward as ak
+
+import numpy as np
 import uproot
+
 
 # glob pattern: '*' stands in for the run number, so every matching file
 # (0000, 0001, 0007, 0008, ...) gets loaded and combined into one sample below.
 SIM_FILE_PATTERN = "/eos/experiment/wcte/user_data/acraplet/forMarie/WCSimWorkshopData/flattened_files/without_MDT/mu+/wcsim_wCDS_mu+_Beam_780MeV_0cm_*_flat.root"
+
 
 EVENT_DISPLAY_DIR = "/eos/user/m/mprincov/WCTE_event_display"
 
