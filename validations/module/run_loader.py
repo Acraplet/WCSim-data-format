@@ -7,11 +7,16 @@ import sys
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+
+import glob
 
 import awkward as ak
 import uproot
 
-SIM_FILE = "/eos/user/m/mprincov/WCSim/WCSim-data-format/analysis_tools/flat_wCDS_mu-_Beam_350MeV_0cm_0000.root"
+# glob pattern: '*' stands in for the run number, so every matching file
+# (0000, 0001, 0007, 0008, ...) gets loaded and combined into one sample below.
+SIM_FILE_PATTERN = "/eos/experiment/wcte/user_data/acraplet/forMarie/WCSimWorkshopData/flattened_files/without_MDT/mu+/wcsim_wCDS_mu+_Beam_780MeV_0cm_*_flat.root"
 
 EVENT_DISPLAY_DIR = "/eos/user/m/mprincov/WCTE_event_display"
 
@@ -59,10 +64,19 @@ sim_branches = [
     "true_n_scatters_above_7deg",
 ]
 
-with uproot.open(SIM_FILE) as f:
-    sim = f["hits"].arrays(sim_branches, library="ak")
+sim_files = sorted(glob.glob(SIM_FILE_PATTERN))
+if not sim_files:
+    raise FileNotFoundError(f"no files match {SIM_FILE_PATTERN}")
 
-print(f"Loaded {len(sim)} simulated events from {SIM_FILE}")
+sim_parts = []
+for sim_file in sim_files:
+    with uproot.open(sim_file) as f:
+        sim_parts.append(f["hits"].arrays(sim_branches, library="ak"))
+sim = ak.concatenate(sim_parts)
+
+print(f"Loaded {len(sim)} simulated events from {len(sim_files)} files matching {SIM_FILE_PATTERN}:")
+for sim_file in sim_files:
+    print(f"  {sim_file}")
 
 # --- all interaction modes in the simulated sample ---------------------------------
 # flatten_wcsim.C records the primary's fate in `stop_process` (the discrete process
@@ -120,6 +134,7 @@ fig, ax = plt.subplots(figsize=(6, 4))
 ax.hist(ak.to_numpy(sim["true_max_scatter_angle_deg"]), bins=50)
 ax.set_xlabel("true_max_scatter_angle_deg")
 ax.set_ylabel("events")
+ax.set_yscale("log")
 ax.set_title(f"Largest single-step scatter angle of the primary ({PARTICLE})")
 fig.tight_layout()
 
@@ -260,6 +275,34 @@ def find_primary_index(ev):
     )
     return int(matches[0]) if len(matches) else None
 
+# PDG -> short human-readable particle name, for the track-color legend below.
+PDG_NAMES = {
+    11: "e-", -11: "e+",
+    13: "mu-", -13: "mu+",
+    211: "pi+", -211: "pi-", 111: "pi0",
+    2212: "proton", 2112: "neutron",
+    22: "gamma",
+    12: "nu_e", -12: "nu_e_bar",
+    14: "nu_mu", -14: "nu_mu_bar",
+}
+
+def pdg_name(pdg):
+    return PDG_NAMES.get(int(pdg), f"pdg={int(pdg)}")
+
+# fixed particle-name -> color, so the same species always gets the same color
+# across tracks/events (e.g. every muon segment is blue, every electron red).
+PARTICLE_COLORS = {
+    "mu-": "tab:blue", "mu+": "tab:cyan",
+    "e-": "tab:red", "e+": "tab:orange",
+    "pi+": "tab:green", "pi-": "tab:olive", "pi0": "yellowgreen",
+    "proton": "tab:purple", "neutron": "tab:brown",
+    "gamma": "gold",
+    "nu_e": "silver", "nu_e_bar": "silver",
+    "nu_mu": "silver", "nu_mu_bar": "silver",
+}
+DARK_NOISE_COLOR = "lightgray"
+UNKNOWN_PARTICLE_COLOR = "black"
+
 # --- per-hit view of the simulation, unmasked (no good_wcte_pmts filtering applied) ---
 sim_hits = ak.zip({
     "slot": sim["hit_mpmt_slot_ids"],
@@ -282,9 +325,10 @@ for sim_event_idx in large_scatter_event_indices:
     sim_ev, sim_ev_hits = sim[sim_event_idx], sim_hits[sim_event_idx]
     scatter_angle = float(sim_ev["true_max_scatter_angle_deg"])
 
-    fig, ax = plt.subplots(figsize=(7, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # colored by parent TRACK ID (not charge)
+    # --- left: colored by particle species (every track of the same species
+    #     gets the same fixed color, so e.g. muon vs electron is obvious) ---
     track_ids_in_event = sorted(set(ak.to_list(sim_ev_hits["hit_track_id"])))
     track_id_to_color_index = {tid: i for i, tid in enumerate(track_ids_in_event)}
     hit_color_index = [track_id_to_color_index[tid] for tid in ak.to_list(sim_ev_hits["hit_track_id"])]
@@ -293,25 +337,77 @@ for sim_event_idx in large_scatter_event_indices:
         ak.to_list(sim_ev_hits["slot"]), ak.to_list(sim_ev_hits["pos"]),
         hit_color_index, ed.nChannels,
     )
+
+    sim_hit_tids = ak.to_list(sim_ev_hits["hit_track_id"])
+    hits_per_track = Counter(sim_hit_tids)
+
+    track_names, track_colors = [], []
+    for tid in track_ids_in_event:
+        matches = np.flatnonzero(np.asarray(sim_ev["track_id"]) == tid)
+        if len(matches):
+            name = pdg_name(sim_ev["track_pdg"][matches[0]])
+            color = PARTICLE_COLORS.get(name, UNKNOWN_PARTICLE_COLOR)
+        elif tid == -1:
+            name, color = "dark noise", DARK_NOISE_COLOR
+        else:
+            name, color = "no truth match", UNKNOWN_PARTICLE_COLOR
+        track_names.append(name)
+        track_colors.append(color)
+
+    track_cmap = mcolors.ListedColormap(track_colors)
+    track_norm = mcolors.BoundaryNorm(np.arange(-0.5, len(track_colors) + 0.5, 1), len(track_colors))
     draw_event(
-        ax, ed, sim_channel_track, cmap=plt.cm.tab20,
-        norm=mcolors.Normalize(vmin=0, vmax=max(len(track_ids_in_event) - 1, 1)),
+        axes[0], ed, sim_channel_track, cmap=track_cmap,
+        norm=track_norm,
         title=f"MC {PARTICLE} (event {int(sim_ev['event_number'])}): {classify_outcome(str(sim_ev['stop_process']), sim_ev['had_inelastic'], sim_ev['had_elastic'], sim_ev['true_exit_ke'])}, "
               f"max scatter {scatter_angle:.1f} deg",
-        color_label="track index (see legend below)",
+        color_label="particle",
     )
+
+    # --- legend on the left panel: one entry per particle species present ---
+    species_colors = dict(zip(track_names, track_colors))  # last-write-wins, colors are fixed per name anyway
+    species_legend_handles = [
+        Line2D([0], [0], marker="o", linestyle="", markersize=8,
+               markerfacecolor=color, markeredgecolor="none", label=name)
+        for name, color in species_colors.items()
+    ]
+    axes[0].legend(handles=species_legend_handles, loc="upper left", fontsize=8,
+                    title="particle", framealpha=0.9)
+
+    # --- right: colored by charge ---
+    sim_channel_q = channel_first_value(
+        ak.to_list(sim_ev_hits["slot"]), ak.to_list(sim_ev_hits["pos"]),
+        ak.to_list(sim_ev_hits["q"]), ed.nChannels,
+    )
+    draw_event(
+        axes[1], ed, sim_channel_q, cmap=plt.cm.plasma,
+        norm=mcolors.Normalize(vmin=0, vmax=np.nanmax(sim_channel_q) if np.any(~np.isnan(sim_channel_q)) else 1),
+        title=f"MC {PARTICLE} (event {int(sim_ev['event_number'])}): charge",
+        color_label="charge [p.e.]",
+    )
+    ke_loss = sim_ev['true_max_scatter_ke_post'] - sim_ev['true_max_scatter_ke_pre']
+
     fig.tight_layout()
+    fig.subplots_adjust(top=0.78)
+    fig.suptitle(
+        f"stop_process={sim_ev['stop_process']}  true_stopvol={sim_ev['true_stopvol']}\n"
+        f"true_stop_z={sim_ev['true_stop_z']:.2f} cm  true_max_scatter_z={sim_ev['true_max_scatter_z']:.2f} cm  "
+        f"true_max_scatter_process={sim_ev['true_max_scatter_process']}\n"
+        f"true_max_scatter_ke_post - true_max_scatter_ke_pre = {ke_loss:.2f} MeV",
+        fontsize=14,
+    )
 
     out_pdf = Path(__file__).parent / "plots" / f"event_display_evt{sim_event_idx}_scatter{scatter_angle:.1f}deg.pdf"
     fig.savefig(out_pdf)
     print(f"Saved plot to {out_pdf}")
     plt.close(fig)
 
-    sim_hit_tids = ak.to_list(sim_ev_hits["hit_track_id"])
-    hits_per_track = Counter(sim_hit_tids)
-
     # legend: which track index corresponds to which particle
     print(f"Track color legend for event {sim_event_idx}:")
+    print(f"  stop_process={sim_ev['stop_process']}  true_stopvol={sim_ev['true_stopvol']}  "
+          f"true_stop_z={sim_ev['true_stop_z']:.2f} cm  "
+          f"true_max_scatter_z={sim_ev['true_max_scatter_z']:.2f} cm  "
+          f"true_max_scatter_process={sim_ev['true_max_scatter_process']}")
     for tid, idx in track_id_to_color_index.items():
         matches = np.flatnonzero(np.asarray(sim_ev["track_id"]) == tid)
         n = hits_per_track[tid]
