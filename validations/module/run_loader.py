@@ -8,10 +8,13 @@ import sys
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+import awkward as ak
+
 import numpy as np
 import uproot
 
-SIM_FILE = "/eos/user/m/mprincov/WCSim/WCSim-data-format/analysis_tools/flat_wCDS_mu-_Beam_350MeV_0cm_0000.root"
+SIM_FILE = "/eos/experiment/wcte/user_data/acraplet/forMarie/WCSimWorkshopData/flattened_files/with_MDT/mu+/mdt_wCDS_mu+_Beam_780MeV_0cm_0000_flat.root"
+#"/eos/user/m/mprincov/WCSim/WCSim-data-format/analysis_tools/flat_wCDS_mu-_Beam_350MeV_0cm_0000.root"
 
 EVENT_DISPLAY_DIR = "/eos/user/m/mprincov/WCTE_event_display"
 
