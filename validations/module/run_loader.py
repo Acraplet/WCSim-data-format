@@ -2,11 +2,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import awkward as ak
+import numpy as np
 import uproot
 
-# Same branch list used in examples/compare_sim_data.ipynb section 1, so a
-# RunData.events plays nicely with code lifted from that notebook.
+# Same branch list used in examples/compare_sim_data.ipynb section 1.
 DEFAULT_SIM_BRANCHES = [
     # per-hit
     "hit_pmt_charges", "hit_pmt_calibrated_times", "hit_mpmt_slot_ids", "hit_pmt_position_ids",
@@ -26,17 +25,28 @@ DEFAULT_SIM_BRANCHES = [
 
 @dataclass
 class RunData:
+    """events: {branch name -> numpy array}, one entry per branch.
+
+    Per-event scalar branches (true_pdg, n_digihits, ...) come back as plain
+    1D numpy arrays. Per-hit/per-track (jagged) branches (hit_pmt_charges,
+    track_id, ...) come back as a 1D object-dtype numpy array whose i-th
+    element is itself a 1D numpy array holding that event's values - no
+    awkward dependency needed.
+    """
+
     name: str
     flat_file: Path
-    events: ak.Array
+    events: Dict[str, np.ndarray]
 
     def __len__(self) -> int:
-        return len(self.events)
+        return len(next(iter(self.events.values())))
 
 
 class RunLoader:
-    """Reads flatten_wcsim.C output ("hits" TTree) into awkward arrays, one
-    RunData per run - the same load step as compare_sim_data.ipynb section 1.
+    """Reads flatten_wcsim.C output ("hits" TTree) into plain numpy arrays,
+    one RunData per run - the same load step as compare_sim_data.ipynb
+    section 1, but without depending on awkward (not installed in the
+    WCSim container).
     """
 
     def __init__(self, branches: Optional[List[str]] = None, tree_name: str = "hits"):
@@ -46,8 +56,9 @@ class RunLoader:
     def load(self, name: str, flat_file) -> RunData:
         flat_file = Path(flat_file)
         with uproot.open(flat_file) as f:
-            events = f[self.tree_name].arrays(self.branches, library="ak")
-        print(f"[{name}] loaded {len(events)} events from {flat_file}")
+            events = f[self.tree_name].arrays(self.branches, library="np")
+        n_events = len(next(iter(events.values())))
+        print(f"[{name}] loaded {n_events} events from {flat_file}")
         return RunData(name=name, flat_file=flat_file, events=events)
 
     def load_all(self, flat_files: Dict[str, Path]) -> Dict[str, RunData]:

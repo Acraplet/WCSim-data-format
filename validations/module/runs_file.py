@@ -11,7 +11,7 @@ def parse_runs_file(path) -> List[RunSpec]:
 
         <name>  <raw_file>  [is_mdt]
 
-    - raw_file may be absolute, or relative to AnalysisPaths.raw_data_dir
+    - raw_file may be absolute, or relative to the current working directory
       (resolved later by Flattener, not here).
     - is_mdt is optional: -1 (default, auto-detect), 0 (force plain WCSim),
       or 1 (force MDT) - see flatten_wcsim.C.

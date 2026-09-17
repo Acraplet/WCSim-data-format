@@ -31,7 +31,7 @@ class Flattener:
         self.paths = paths
 
     def resolve_raw(self, run: RunSpec) -> Path:
-        return self.paths.raw_path(run.raw_file)
+        return Path(run.raw_file)
 
     def resolve_flat(self, run: RunSpec) -> Path:
         if run.flat_file is not None:
@@ -41,6 +41,36 @@ class Flattener:
             base = Path(self.paths.flat_data_dir) if self.paths.flat_data_dir else self.resolve_raw(run).parent
             return base / p
         return self.paths.flat_path(self.resolve_raw(run))
+
+    def flatten_to(self, raw: Path, flat: Path, is_mdt: int = -1, capture_output: bool = False) -> str:
+        """Run flatten_single_file.sh raw->flat unconditionally (no exists-check).
+
+        Returns flatten_wcsim.C's stdout (captured and also echoed to the
+        console when capture_output=True; streamed directly otherwise) - the
+        caller can inspect it, e.g. to see which MDT auto-detection branch
+        the macro took (see parse_is_mdt_from_output).
+        """
+        script = self.paths.flatten_script
+        if not script.exists():
+            raise FileNotFoundError(f"flatten script not found: {script}")
+
+        flat.parent.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["WCSIM_BUILD_DIR"] = self.paths.wcsim_build_dir
+
+        cmd = [str(script), str(raw), str(flat), str(is_mdt)]
+        print(f"flattening: {' '.join(cmd)}")
+        result = subprocess.run(cmd, env=env, capture_output=capture_output, text=True)
+        if capture_output:
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="")
+        if result.returncode != 0:
+            raise RuntimeError(f"flattening failed for {raw} (exit code {result.returncode})")
+
+        return result.stdout or ""
 
     def ensure_flattened(self, run: RunSpec, force: bool = False) -> Path:
         """Flatten `run` if its flattened output doesn't exist yet (or force=True).
@@ -56,23 +86,24 @@ class Flattener:
             print(f"[{run.name}] flattened file already exists, skipping flatten: {flat}")
             return flat
 
-        script = self.paths.flatten_script
-        if not script.exists():
-            raise FileNotFoundError(f"flatten script not found: {script}")
-
-        flat.parent.mkdir(parents=True, exist_ok=True)
-
-        env = os.environ.copy()
-        env["WCSIM_BUILD_DIR"] = self.paths.wcsim_build_dir
-
-        cmd = [str(script), str(raw), str(flat), str(run.is_mdt)]
-        print(f"[{run.name}] flattening: {' '.join(cmd)}")
-        result = subprocess.run(cmd, env=env)
-        if result.returncode != 0:
-            raise RuntimeError(f"[{run.name}] flattening failed (exit code {result.returncode})")
-
+        print(f"[{run.name}] flattening -> {flat}")
+        self.flatten_to(raw, flat, is_mdt=run.is_mdt)
         return flat
 
     def ensure_all(self, runs: List[RunSpec], force: bool = False) -> Dict[str, Path]:
         """Flatten every run that needs it, returning {run name: flat file path}."""
         return {run.name: self.ensure_flattened(run, force=force) for run in runs}
+
+
+def parse_is_mdt_from_output(output: str) -> bool:
+    """Recover flatten_wcsim.C's MDT auto-detection result from its own stdout
+    (its DetectIsMDT() printf: "... input as MDT-processed ..." / "... as plain WCSim ...").
+    """
+    if "MDT-processed" in output:
+        return True
+    if "plain WCSim" in output:
+        return False
+    raise RuntimeError(
+        "could not determine MDT status from flatten_wcsim.C output - "
+        "expected 'MDT-processed' or 'plain WCSim' in its printout"
+    )
