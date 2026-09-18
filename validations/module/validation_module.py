@@ -146,6 +146,7 @@ def plot_histogram_by_particle_and_energy(
     bins=50,
     out_dir=None,
     out_name: Optional[str] = None,
+    log_y: bool = False,
 ) -> Path:
     """Histogram `variable`, overlaying one series per (pdg_col, energy_col)
     combination in df on a single plot.
@@ -153,6 +154,10 @@ def plot_histogram_by_particle_and_energy(
     Groups the combined DataFrame by true PID and starting energy (each
     (pdg, energy) pair is assumed to be one simulated beam configuration).
     Saves one PDF containing all series and returns its path.
+
+    log_y: draw the y-axis (event counts) on a log scale - useful for
+    long-tailed distributions (e.g. scatter angle) where a linear scale
+    hides everything past the peak.
     """
     out_dir = Path(out_dir) if out_dir else Path(__file__).parent.parent / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +179,9 @@ def plot_histogram_by_particle_and_energy(
     ax.set_xlabel(variable)
     ax.set_ylabel("events")
     ax.set_title(variable)
+    ax.grid(True, alpha=0.3)
+    if log_y:
+        ax.set_yscale("log")
     ax.legend(frameon=False)
     fig.tight_layout()
 

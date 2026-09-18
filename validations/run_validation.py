@@ -66,16 +66,16 @@ def main():
         print(f"{name}: loaded {len(group)} events")
     print(f"total: {len(df)} events from {df['run_name'].nunique()} run(s)")
 
-    plot_histogram_by_particle_and_energy(df, "true_max_scatter_angle_deg")
+    plot_histogram_by_particle_and_energy(df, "true_max_scatter_angle_deg", log_y = True)
 
     # pick one event to display: the first photon event if there is one, else event_index 3.
     # event_index doubles as df's row index (see load_runs), so .loc[] gives the single
     # row straight back as a Series - what plot_event_display expects.
-    particle_event_indices = df.loc[df["true_pdg"] == -13, "event_index"]
+    particle_event_indices = df.loc[df["true_max_scatter_angle_deg"] >= 4, "event_index"]
 
     print(f"In this dataset there are {particle_event_indices.nunique()} unique events matching the criteria.")
 
-    evt_index = int(particle_event_indices.iloc[4]) if not particle_event_indices.empty else 3
+    evt_index = int(particle_event_indices.iloc[0]) if not particle_event_indices.empty else 3
     print(f"Plotting event display for event_index={evt_index}")
 
     plot_event_display(df.loc[evt_index], "/eos/user/a/acraplet/WCTE_event_display/")
